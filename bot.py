@@ -24,23 +24,24 @@ class ThreadStatusView(discord.ui.View):
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
         if staff_role and staff_role in interaction.user.roles:
             return True
-        else:
-            await interaction.response.send_message("❌ You don't have permission to use these buttons.", ephemeral=True)
-            return False
+        await interaction.response.send_message("❌ You don't have permission to use these buttons.", ephemeral=True)
+        return False
 
     @discord.ui.button(label="Being handled", style=discord.ButtonStyle.primary, custom_id="thread:being_handled")
     async def being_handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🔵")
+        await self.update_thread(interaction, "🔵", delete=False)
 
     @discord.ui.button(label="Handled", style=discord.ButtonStyle.success, custom_id="thread:handled")
     async def handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🟢")
+        await self.update_thread(interaction, "🟢", delete=True)
 
     @discord.ui.button(label="No action", style=discord.ButtonStyle.danger, custom_id="thread:no_action")
     async def no_action(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🔴")
+        await self.update_thread(interaction, "🔴", delete=True)
 
-    async def update_thread(self, interaction: discord.Interaction, emoji: str):
+    async def update_thread(self, interaction: discord.Interaction, emoji: str, delete: bool):
+        await interaction.response.defer()   # Prevents "did not respond in time"
+        
         thread = interaction.channel
         if isinstance(thread, discord.Thread):
             new_name = f"{emoji} {thread.name.lstrip('🔵🟢🔴 ')}"
@@ -48,10 +49,21 @@ class ThreadStatusView(discord.ui.View):
                 await thread.edit(name=new_name[:100])
             except:
                 pass
-        
+            
+            if delete:
+                await asyncio.sleep(2)  # Small delay so user can see the change
+                try:
+                    await thread.delete()
+                except:
+                    await thread.edit(archived=True)
+
+        # Update embed
         embed = interaction.message.embeds[0]
         embed.title = f"{emoji} Status Updated"
-        await interaction.response.edit_message(embed=embed)
+        try:
+            await interaction.edit_original_response(embed=embed)
+        except:
+            pass
 
 
 @bot.event
@@ -69,11 +81,7 @@ async def on_thread_create(thread: discord.Thread):
     role = thread.guild.get_role(ROLE_ID_TO_PING)
     ping = role.mention if role else "@here"
 
-    creator = "Unknown"
-    if thread.owner:
-        creator = thread.owner.mention
-    elif thread.owner_id:
-        creator = f"<@{thread.owner_id}>"
+    creator = thread.owner.mention if thread.owner else f"<@{thread.owner_id}>" if thread.owner_id else "Unknown"
 
     embed = discord.Embed(
         title="New Game Report - Awaiting Action",
@@ -102,3 +110,9 @@ async def run_web():
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
+
+
+
+
+
+
