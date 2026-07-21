@@ -7,6 +7,7 @@ from aiohttp import web
 THREAD_CHANNEL_ID = 1529046450556895282 # ← CHANGE THIS
 ROLE_ID_TO_PING = 1529040758286450819 # ← CHANGE THIS
 STAFF_ROLE_ID = 1477457940553138349     # ← NEW: Role allowed to press buttons
+LOGS_CHANNEL_ID = 1529091178945839164     # ← NEW: Logs channel ID
 # =======================================================
 
 intents = discord.Intents.default()
@@ -24,46 +25,68 @@ class ThreadStatusView(discord.ui.View):
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
         if staff_role and staff_role in interaction.user.roles:
             return True
-        await interaction.response.send_message("❌ You don't have permission to use these buttons.", ephemeral=True)
+        await interaction.response.send_message("❌ You don't have permission.", ephemeral=True)
         return False
 
     @discord.ui.button(label="Being handled", style=discord.ButtonStyle.primary, custom_id="thread:being_handled")
     async def being_handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🔵", delete=False)
+        await self.update_status(interaction, "🔵", "Being handled", delete=False)
 
     @discord.ui.button(label="Handled", style=discord.ButtonStyle.success, custom_id="thread:handled")
     async def handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🟢", delete=True)
+        await self.update_status(interaction, "🟢", "Handled", delete=True)
 
     @discord.ui.button(label="No action", style=discord.ButtonStyle.danger, custom_id="thread:no_action")
     async def no_action(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.update_thread(interaction, "🔴", delete=True)
+        await self.update_status(interaction, "🔴", "No action", delete=True)
 
-    async def update_thread(self, interaction: discord.Interaction, emoji: str, delete: bool):
-        await interaction.response.defer()   # Prevents "did not respond in time"
-        
+    async def update_status(self, interaction: discord.Interaction, emoji: str, status: str, delete: bool):
+        await interaction.response.defer()
+
         thread = interaction.channel
+        closer = interaction.user
+
+        # Update thread name
         if isinstance(thread, discord.Thread):
             new_name = f"{emoji} {thread.name.lstrip('🔵🟢🔴 ')}"
             try:
                 await thread.edit(name=new_name[:100])
             except:
                 pass
-            
-            if delete:
-                await asyncio.sleep(2)  # Small delay so user can see the change
-                try:
-                    await thread.delete()
-                except:
-                    await thread.edit(archived=True)
 
         # Update embed
         embed = interaction.message.embeds[0]
-        embed.title = f"{emoji} Status Updated"
-        try:
-            await interaction.edit_original_response(embed=embed)
-        except:
-            pass
+        embed.title = f"{emoji} {status}"
+        embed.set_footer(text=f"Action by: {closer} ({closer.id})")
+        await interaction.edit_original_response(embed=embed)
+
+        # If closing the thread
+        if delete:
+            # Ping original creator
+            creator_mention = thread.owner.mention if thread.owner else f"<@{thread.owner_id}>"
+            try:
+                await thread.send(f"{creator_mention} Your report has been closed.\n**Status:** {status}\n**Closed by:** {closer.mention}")
+            except:
+                pass
+
+            # Send to logs channel
+            logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
+            if logs_channel:
+                log_embed = discord.Embed(
+                    title="Thread Closed",
+                    description=f"**Thread:** {thread.name}\n**Status:** {status}\n**Closed by:** {closer.mention}",
+                    color=discord.Color.green() if status == "Handled" else discord.Color.red(),
+                    timestamp=discord.utils.utcnow()
+                )
+                log_embed.add_field(name="Original Creator", value=creator_mention)
+                await logs_channel.send(embed=log_embed)
+
+            # Delete / Archive thread
+            await asyncio.sleep(3)
+            try:
+                await thread.delete()
+            except:
+                await thread.edit(archived=True)
 
 
 @bot.event
@@ -110,9 +133,3 @@ async def run_web():
 
 
 bot.run(os.getenv("DISCORD_TOKEN"))
-
-
-
-
-
-
