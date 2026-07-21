@@ -190,7 +190,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_thumbnail(url=REPORT_THUMBNAIL_URL)
+    embed.set_image(url=REPORT_THUMBNAIL_URL)
     embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
     if video_link:
@@ -331,7 +331,7 @@ async def on_message(message: discord.Message):
                         "You'll be asked for a reason and a video link/clip.",
             color=discord.Color.blurple(),
         )
-        panel_embed.set_thumbnail(url=REPORT_THUMBNAIL_URL)
+        panel_embed.set_image(url=REPORT_THUMBNAIL_URL)
         await message.channel.send(embed=panel_embed, view=CreateReportView())
         try:
             await message.delete()
