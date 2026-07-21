@@ -250,7 +250,7 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         if logs_channel:
             log_embed = discord.Embed(
                 title="Report Closed",
-                description=f"**Thread:** {thread.name}\n**Final status:** {status}\n**Closed by:** {closer.mention}",
+                description=f"**Thread:** [{thread.name}]({thread.jump_url})\n**Final status:** {status}\n**Closed by:** {closer.mention}",
                 color=discord.Color.green() if status == "Handled" else discord.Color.red(),
                 timestamp=discord.utils.utcnow(),
             )
