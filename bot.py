@@ -1,11 +1,11 @@
 import discord
-from discord.ext import commands
 import os
+import asyncio
+from aiohttp import web
 
 # ========================= CONFIG =========================
-THREAD_CHANNEL_ID = 1529046450556895282  # ← Change to your channel ID
-ROLE_ID_TO_PING = 1529040758286450819      # ← Change to your role ID
-BOT_TOKEN = "MTUyOTA0NzU0MjIwODI2NjM3MQ.GnIYq9.bWp9iWVya3Vqgw7u42mQSwiYAlmXGzrE7si-qs"   # Or hardcode temporarily (not recommended)
+THREAD_CHANNEL_ID = 1529046450556895282   # ← CHANGE THIS
+ROLE_ID_TO_PING = 1529040758286450819     # ← CHANGE THIS
 # =======================================================
 
 intents = discord.Intents.default()
@@ -13,11 +13,11 @@ intents.guilds = True
 intents.messages = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = discord.Client(intents=intents)
 
 class ThreadStatusView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=None)  # Persistent
+        super().__init__(timeout=None)
 
     @discord.ui.button(label="Being handled", style=discord.ButtonStyle.primary, custom_id="thread:being_handled")
     async def being_handled(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -34,7 +34,6 @@ class ThreadStatusView(discord.ui.View):
     async def update_status(self, interaction: discord.Interaction, new_title: str):
         embed = interaction.message.embeds[0]
         embed.title = new_title
-        # Disable all buttons after action
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(embed=embed, view=self)
@@ -43,14 +42,14 @@ class ThreadStatusView(discord.ui.View):
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    # Make buttons persistent
     bot.add_view(ThreadStatusView())
+    asyncio.create_task(run_web())  # Keep Railway alive
 
 
 @bot.event
 async def on_thread_create(thread: discord.Thread):
     if thread.parent_id != THREAD_CHANNEL_ID:
-        return  # Only respond in the configured channel
+        return
 
     role = thread.guild.get_role(ROLE_ID_TO_PING)
     ping = role.mention if role else "@here"
@@ -63,16 +62,21 @@ async def on_thread_create(thread: discord.Thread):
     )
 
     view = ThreadStatusView()
-    msg = await thread.send(f"{ping} New thread needs attention!", embed=embed, view=view)
+    await thread.send(f"{ping} New thread needs attention!", embed=embed, view=view)
 
 
-# Optional: Slash command to test
-@bot.tree.command(name="setup_thread_monitor", description="Confirm the bot is monitoring the channel")
-async def setup(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Monitoring threads in <#{THREAD_CHANNEL_ID}> and pinging <@&{ROLE_ID_TO_PING}>", ephemeral=True)
+# Web server to keep it alive
+async def health(request):
+    return web.Response(text="Bot is running!")
 
-@bot.tree.command(name="test", description="Test if bot is working")
-async def test(interaction: discord.Interaction):
-    await interaction.response.send_message("Bot is working! Channel ID being used: " + str(THREAD_CHANNEL_ID))
+app = web.Application()
+app.router.add_get('/', health)
 
-bot.run(BOT_TOKEN)
+async def run_web():
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', os.getenv("PORT", 8080))
+    await site.start()
+
+
+bot.run(os.getenv("DISCORD_TOKEN"))
