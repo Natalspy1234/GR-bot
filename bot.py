@@ -121,36 +121,96 @@ class ThreadStatusView(discord.ui.View):
         await interaction.response.send_modal(ReasonModal("🔴", "No action"))
 
 
-class ReportModal(discord.ui.Modal, title="Create Report"):
-    reason_input = discord.ui.TextInput(
-        label="Reason",
-        style=discord.TextStyle.paragraph,
-        placeholder="Explain what happened...",
-        required=True,
-        max_length=1000,
-    )
-    video_input = discord.ui.TextInput(
-        label="Video clip link",
-        style=discord.TextStyle.short,
-        placeholder="Paste a link — or leave blank if you'll upload a clip in the channel instead",
-        required=False,
-        max_length=300,
-    )
+REASON_OPTIONS = [
+    ("RDM", "rdm"),
+    ("VDM", "vdm"),
+    ("GTA Driving", "gta_driving"),
+    ("Other", "other"),
+]
+REASON_LABELS = {value: label for label, value in REASON_OPTIONS}
+
+
+class OtherReasonModal(discord.ui.Modal, title="Report Details"):
+    def __init__(self, selected_values):
+        super().__init__()
+        self.selected_values = selected_values
+        self.other_input = discord.ui.TextInput(
+            label="Describe the reason",
+            style=discord.TextStyle.short,
+            placeholder="What happened?",
+            required=True,
+            max_length=100,
+        )
+        self.video_input = discord.ui.TextInput(
+            label="Video clip link",
+            style=discord.TextStyle.short,
+            placeholder="Paste a link — or leave blank if you'll upload a clip instead",
+            required=False,
+            max_length=300,
+        )
+        self.add_item(self.other_input)
+        self.add_item(self.video_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await create_report_channel(interaction, self.reason_input.value, self.video_input.value)
+        labels = [self.other_input.value if v == "other" else REASON_LABELS.get(v, v) for v in self.selected_values]
+        await create_report_channel(interaction, ", ".join(labels), self.video_input.value)
+
+
+class VideoLinkModal(discord.ui.Modal, title="Report Details"):
+    def __init__(self, selected_values):
+        super().__init__()
+        self.selected_values = selected_values
+        self.video_input = discord.ui.TextInput(
+            label="Video clip link",
+            style=discord.TextStyle.short,
+            placeholder="Paste a link — or leave blank if you'll upload a clip instead",
+            required=False,
+            max_length=300,
+        )
+        self.add_item(self.video_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        labels = [REASON_LABELS.get(v, v) for v in self.selected_values]
+        await create_report_channel(interaction, ", ".join(labels), self.video_input.value)
+
+
+class ReasonSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=label, value=value) for label, value in REASON_OPTIONS]
+        super().__init__(
+            placeholder="Select one or more reasons...",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values
+        if "other" in selected:
+            await interaction.response.send_modal(OtherReasonModal(selected))
+        else:
+            await interaction.response.send_modal(VideoLinkModal(selected))
+
+
+class ReasonSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ReasonSelect())
 
 
 class CreateReportView(discord.ui.View):
     """Posted once in PANEL_CHANNEL_ID. Anyone can click it to open a report,
-    fill in a reason + video link/clip, and get a private channel with staff."""
+    pick a reason (or type one in for 'Other'), give a video link/clip, and
+    get a private channel with staff."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Create Report", emoji="📝", style=discord.ButtonStyle.primary, custom_id="report:create")
     async def create_report(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ReportModal())
+        await interaction.response.send_message(
+            "Select the reason(s) for this report:", view=ReasonSelectView(), ephemeral=True
+        )
 
 
 async def create_report_channel(interaction: discord.Interaction, reason: str, video_link: str):
@@ -185,7 +245,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
     ping = role.mention if role else None
 
     embed = discord.Embed(
-        title="New Game Report - Awaiting Action",
+        title=f"New Report: {reason}",
         description="Please check this game report",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
