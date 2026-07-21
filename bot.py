@@ -3,11 +3,11 @@ import os
 import asyncio
 from aiohttp import web
 # ========================= CONFIG =========================
-THREAD_CHANNEL_ID = 1529046450556895282 # ← CHANGE THIS
-ROLE_ID_TO_PING = 1529040758286450819 # ← CHANGE THIS
-STAFF_ROLE_ID = 1477457940553138349     # ← NEW: Role allowed to press buttons
-LOGS_CHANNEL_ID = 1529091178945839164     # ← NEW: Logs channel ID
-CLOSED_THREADS_CHANNEL_ID = 1529093723416428695 # ← NEW: Threads-enabled channel where a closed-report thread is created to ping the creator
+THREAD_CHANNEL_ID = 1529046450556895282 # Channel where threads are created
+ROLE_ID_TO_PING = 1529040758286450819 # Role that gets pinged on new thread
+STAFF_ROLE_ID = 1477457940553138349 # Role allowed to use buttons
+LOGS_CHANNEL_ID = 1529091178945839164 # Logs channel ID
+CLOSED_THREADS_CHANNEL_ID = 1529093723416428695 # Threads-enabled channel where a closed-report thread is created to ping the creator
 # =======================================================
 intents = discord.Intents.default()
 intents.guilds = True
@@ -51,11 +51,6 @@ class ThreadStatusView(discord.ui.View):
         # If closing the thread
         if delete:
             creator_mention = thread.owner.mention if thread.owner else f"<@{thread.owner_id}>"
-            # Notify inside the thread (no ping, since the creator is now pinged in a separate channel)
-            try:
-                await thread.send(f"This report has been closed.\n**Status:** {status}\n**Closed by:** {closer.mention}")
-            except:
-                pass
             # Create a new thread in the closed-threads channel and ping the creator there
             closed_threads_channel = interaction.guild.get_channel(CLOSED_THREADS_CHANNEL_ID)
             if closed_threads_channel:
@@ -65,8 +60,10 @@ class ThreadStatusView(discord.ui.View):
                         type=discord.ChannelType.public_thread
                     )
                     await closed_thread.send(f"{creator_mention} Your report **{thread.name}** has been closed.\n**Status:** {status}\n**Closed by:** {closer.mention}")
-                except:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ Failed to create closed-report thread: {e}")
+            else:
+                print(f"⚠️ CLOSED_THREADS_CHANNEL_ID ({CLOSED_THREADS_CHANNEL_ID}) not found in guild.")
             # Send to logs channel
             logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
             if logs_channel:
@@ -116,17 +113,3 @@ async def run_web():
     site = web.TCPSite(runner, '0.0.0.0', os.getenv("PORT", 8080))
     await site.start()
 bot.run(os.getenv("DISCORD_TOKEN"))
-
-
-# ========================= CONFIG =========================
-THREAD_CHANNEL_ID = 1529046450556895282 # ← CHANGE THIS
-ROLE_ID_TO_PING = 1529040758286450819 # ← CHANGE THIS
-STAFF_ROLE_ID = 1477457940553138349     # ← NEW: Role allowed to press buttons
-LOGS_CHANNEL_ID = 1529091178945839164     # ← NEW: Logs channel ID
-# =======================================================
-
-
-
-
-
-
