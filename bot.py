@@ -72,11 +72,11 @@ async def resolve_member(guild: discord.Guild, user_id: int):
     return member
 
 
-def make_channel_name(user: discord.abc.User) -> str:
-    base = re.sub(r"[^a-z0-9-]", "", user.display_name.lower().replace(" ", "-"))
-    if not base:
-        base = "user"
-    return f"report-{base}-{str(user.id)[-4:]}"[:100]
+def make_channel_name(reason: str, user: discord.abc.User) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", reason.lower()).strip("-")
+    if not slug:
+        slug = "report"
+    return f"{slug}-{str(user.id)[-4:]}"[:100]
 
 
 class ReasonModal(discord.ui.Modal):
@@ -232,7 +232,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
 
     try:
         channel = await guild.create_text_channel(
-            name=make_channel_name(creator),
+            name=make_channel_name(reason, creator),
             category=category,
             overwrites=overwrites,
             reason=f"Report opened by {creator} ({creator.id})",
@@ -245,7 +245,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
     ping = role.mention if role else None
 
     embed = discord.Embed(
-        title=f"New Report: {reason}",
+        title="New Game Report - Awaiting Action",
         description="Please check this game report",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
