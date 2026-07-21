@@ -1,16 +1,20 @@
 import discord
 import os
+import re
 import asyncio
 from aiohttp import web
 # ========================= CONFIG =========================
-THREAD_CHANNEL_ID = 1529046450556895282 # Channel where threads are created
-ROLE_ID_TO_PING = 1529040758286450819 # Role that gets pinged on new thread
-STAFF_ROLE_ID = 1477457940553138349 # Role allowed to use buttons
-LOGS_CHANNEL_ID = 1529091178945839164 # Logs channel ID
-CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782 # Channel where an embed is posted to notify the creator their report is closed
+THREAD_CHANNEL_ID = 1529103880506310918        # Channel where the "Create Report" button lives, and where threads are created
+ROLE_ID_TO_PING = 1529040758286450819          # Role that gets pinged on new thread
+STAFF_ROLE_ID = 1477457940553138349            # Role allowed to use the status buttons
+REPORTER_ROLE_ID = 1529103473696575498         # Role given to a report creator while their thread is open
+LOGS_CHANNEL_ID = 1529091178945839164          # Logs channel ID
+CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782  # Channel where an embed is posted to notify the creator their report is closed
+SETUP_COMMAND = "!setup_report_button"         # Text command (staff only) to (re)post the "Create Report" panel
 # =======================================================
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True  # needed to add/remove roles reliably
 intents.messages = True
 intents.message_content = True
 bot = discord.Client(intents=intents)
@@ -44,6 +48,41 @@ def get_history(embed: discord.Embed) -> str:
         if field.name == "History":
             return field.value
     return "No actions recorded."
+
+
+def build_report_embed(creator: discord.abc.User) -> discord.Embed:
+    """Build the standard 'new report' embed. Stores the creator's ID in a
+    parse-friendly format so it can be recovered later (e.g. on close) even
+    if the thread's actual Discord 'owner' ends up being the bot."""
+    role = None
+    embed = discord.Embed(
+        title="New Game Report - Awaiting Action",
+        description="Please check this game report",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
+    return embed
+
+
+def extract_creator_id(embed: discord.Embed):
+    """Pull the report creator's user ID back out of the 'Created by' field."""
+    for field in embed.fields:
+        if field.name == "Created by":
+            match = re.search(r"`(\d+)`", field.value)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+async def resolve_member(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            member = None
+    return member
 
 
 class ReasonModal(discord.ui.Modal):
@@ -88,6 +127,52 @@ class ThreadStatusView(discord.ui.View):
         await interaction.response.send_modal(ReasonModal("🔴", "No action"))
 
 
+class CreateReportView(discord.ui.View):
+    """Posted once in THREAD_CHANNEL_ID. Anyone can click it to open a new
+    report thread, get the standard embed + status buttons, and receive the
+    reporter role for the duration of the report."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create Report", emoji="📝", style=discord.ButtonStyle.primary, custom_id="report:create")
+    async def create_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        channel = interaction.channel
+        try:
+            thread = await channel.create_thread(
+                name=f"Report - {interaction.user.display_name}"[:100],
+                type=discord.ChannelType.public_thread,
+                reason=f"Report opened by {interaction.user} ({interaction.user.id})",
+            )
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ Couldn't create a thread: {e}", ephemeral=True)
+            return
+
+        role = interaction.guild.get_role(ROLE_ID_TO_PING)
+        ping = role.mention if role else None
+
+        embed = build_report_embed(interaction.user)
+        view = ThreadStatusView()
+        await thread.send(content=ping, embed=embed, view=view)
+
+        try:
+            await thread.add_user(interaction.user)
+        except Exception:
+            pass
+
+        # Assign the reporter role for the duration of the report
+        reporter_role = interaction.guild.get_role(REPORTER_ROLE_ID)
+        if reporter_role:
+            try:
+                await interaction.user.add_roles(reporter_role, reason="Opened a report thread")
+            except Exception as e:
+                print(f"⚠️ Failed to add reporter role: {e}")
+
+        await interaction.followup.send(f"✅ Your report thread has been created: {thread.mention}", ephemeral=True)
+
+
 async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None):
     thread = interaction.channel
     closer = interaction.user
@@ -128,7 +213,18 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
 
     # If closing the report
     if delete:
-        creator_mention = thread.owner.mention if thread.owner else f"<@{thread.owner_id}>"
+        creator_id = extract_creator_id(embed)
+        creator_member = await resolve_member(interaction.guild, creator_id) if creator_id else None
+        creator_mention = creator_member.mention if creator_member else (f"<@{creator_id}>" if creator_id else "Unknown user")
+
+        # Remove the reporter role now that the report is closed
+        if creator_member:
+            reporter_role = interaction.guild.get_role(REPORTER_ROLE_ID)
+            if reporter_role and reporter_role in creator_member.roles:
+                try:
+                    await creator_member.remove_roles(reporter_role, reason="Report closed")
+                except Exception as e:
+                    print(f"⚠️ Failed to remove reporter role: {e}")
 
         # Notify in the closed-reports channel
         closed_channel = interaction.guild.get_channel(CLOSED_REPORTS_CHANNEL_ID)
@@ -164,37 +260,74 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
             log_embed.add_field(name="History", value=get_history(embed), inline=False)
             await logs_channel.send(embed=log_embed)
 
-        # Delete / Archive thread
+        # Archive (and lock) the thread instead of deleting it, so the history is preserved
         await asyncio.sleep(3)
         try:
-            await thread.delete()
-        except:
-            await thread.edit(archived=True)
+            await thread.edit(archived=True, locked=True)
+        except Exception as e:
+            print(f"⚠️ Failed to archive thread: {e}")
 
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     bot.add_view(ThreadStatusView())
+    bot.add_view(CreateReportView())
     asyncio.create_task(run_web())
 
 
 @bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if message.content.strip() == SETUP_COMMAND:
+        staff_role = message.guild.get_role(STAFF_ROLE_ID) if message.guild else None
+        if not staff_role or staff_role not in message.author.roles:
+            return
+        panel_embed = discord.Embed(
+            title="📝 Submit a Game Report",
+            description="Click the button below to open a private report thread. "
+                        "A staff member will be with you shortly.",
+            color=discord.Color.blurple(),
+        )
+        await message.channel.send(embed=panel_embed, view=CreateReportView())
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+
+@bot.event
 async def on_thread_create(thread: discord.Thread):
+    # Only handle the configured channel, and skip threads the bot itself
+    # created via the "Create Report" button (those are already handled there).
     if thread.parent_id != THREAD_CHANNEL_ID:
         return
+    if thread.owner_id == bot.user.id:
+        return
+
     role = thread.guild.get_role(ROLE_ID_TO_PING)
     ping = role.mention if role else "@here"
-    creator = thread.owner.mention if thread.owner else f"<@{thread.owner_id}>" if thread.owner_id else "Unknown"
-    embed = discord.Embed(
+    creator = thread.owner if thread.owner else None
+
+    embed = build_report_embed(creator) if creator else discord.Embed(
         title="New Game Report - Awaiting Action",
-        description=f"{ping}, Please check this game report",
+        description="Please check this game report",
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
-    embed.add_field(name="Created by", value=creator, inline=True)
+    embed.description = f"{ping}, Please check this game report"
     view = ThreadStatusView()
     await thread.send(embed=embed, view=view)
+
+    # Manually-created threads also grant the reporter role
+    if creator:
+        reporter_role = thread.guild.get_role(REPORTER_ROLE_ID)
+        if reporter_role:
+            try:
+                await creator.add_roles(reporter_role, reason="Opened a report thread")
+            except Exception as e:
+                print(f"⚠️ Failed to add reporter role: {e}")
 
 
 # Web server
