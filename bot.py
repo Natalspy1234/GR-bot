@@ -6,13 +6,14 @@ from aiohttp import web
 # ========================= CONFIG =========================
 PANEL_CHANNEL_ID = 1529103880506310918         # Channel where the "Create Report" button/panel lives
 REPORTS_CATEGORY_ID = 1477260121339072532      # Category new report channels are created under
-CLOSED_CATEGORY_ID = None                      # Optional: category closed report channels get moved into (leave as None to keep them where they are)
+CLOSED_CATEGORY_ID = 1529247109537202337       # Category closed report channels get moved into
 ROLE_ID_TO_PING = 1529040758286450819          # Role that gets pinged on new report channel
 STAFF_ROLE_ID = 1477457940553138349            # Role allowed to view report channels / use the status buttons
 REPORTER_ROLE_ID = 1529103473696575498         # Role given to a report creator while their report channel is open
 LOGS_CHANNEL_ID = 1529091178945839164          # Logs channel ID
 CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782  # Channel where an embed is posted to notify the creator their report is closed
 SETUP_COMMAND = "!setup_report_button"         # Text command (staff only) to (re)post the "Create Report" panel
+REPORT_THUMBNAIL_URL = "https://cdn.discordapp.com/attachments/1477262109480980621/1529247992521953380/game_reposts_banner.png"  # Thumbnail shown on report embeds
 # =======================================================
 intents = discord.Intents.default()
 intents.guilds = True
@@ -189,6 +190,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
         color=discord.Color.blurple(),
         timestamp=discord.utils.utcnow(),
     )
+    embed.set_thumbnail(url=REPORT_THUMBNAIL_URL)
     embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
     if video_link:
@@ -329,6 +331,7 @@ async def on_message(message: discord.Message):
                         "You'll be asked for a reason and a video link/clip.",
             color=discord.Color.blurple(),
         )
+        panel_embed.set_thumbnail(url=REPORT_THUMBNAIL_URL)
         await message.channel.send(embed=panel_embed, view=CreateReportView())
         try:
             await message.delete()
