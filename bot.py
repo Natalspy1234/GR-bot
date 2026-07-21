@@ -6,6 +6,7 @@ from aiohttp import web
 # ========================= CONFIG =========================
 THREAD_CHANNEL_ID = 1529046450556895282 # ← CHANGE THIS
 ROLE_ID_TO_PING = 1529040758286450819 # ← CHANGE THIS
+STAFF_ROLE_ID = 1477457940553138349     # ← NEW: Role allowed to press buttons
 # =======================================================
 
 intents = discord.Intents.default()
@@ -19,6 +20,14 @@ class ThreadStatusView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
+        if staff_role and staff_role in interaction.user.roles:
+            return True
+        else:
+            await interaction.response.send_message("❌ You don't have permission to use these buttons.", ephemeral=True)
+            return False
+
     @discord.ui.button(label="Being handled", style=discord.ButtonStyle.primary, custom_id="thread:being_handled")
     async def being_handled(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_thread(interaction, "🔵")
@@ -27,7 +36,7 @@ class ThreadStatusView(discord.ui.View):
     async def handled(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_thread(interaction, "🟢")
 
-    @discord.ui.button(label="No action", style=discord.ButtonStyle.gray, custom_id="thread:no_action")
+    @discord.ui.button(label="No action", style=discord.ButtonStyle.danger, custom_id="thread:no_action")
     async def no_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.update_thread(interaction, "🔴")
 
@@ -60,7 +69,6 @@ async def on_thread_create(thread: discord.Thread):
     role = thread.guild.get_role(ROLE_ID_TO_PING)
     ping = role.mention if role else "@here"
 
-    # Better way to get creator
     creator = "Unknown"
     if thread.owner:
         creator = thread.owner.mention
