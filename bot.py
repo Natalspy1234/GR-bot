@@ -4,10 +4,12 @@ import re
 import asyncio
 from aiohttp import web
 # ========================= CONFIG =========================
-THREAD_CHANNEL_ID = 1529103880506310918        # Channel where the "Create Report" button lives, and where threads are created
-ROLE_ID_TO_PING = 1529040758286450819          # Role that gets pinged on new thread
-STAFF_ROLE_ID = 1477457940553138349            # Role allowed to use the status buttons
-REPORTER_ROLE_ID = 1529103473696575498         # Role given to a report creator while their thread is open
+PANEL_CHANNEL_ID = 1529103880506310918         # Channel where the "Create Report" button/panel lives
+REPORTS_CATEGORY_ID = 1477260121339072532      # Category new report channels are created under
+CLOSED_CATEGORY_ID = None                      # Optional: category closed report channels get moved into (leave as None to keep them where they are)
+ROLE_ID_TO_PING = 1529040758286450819          # Role that gets pinged on new report channel
+STAFF_ROLE_ID = 1477457940553138349            # Role allowed to view report channels / use the status buttons
+REPORTER_ROLE_ID = 1529103473696575498         # Role given to a report creator while their report channel is open
 LOGS_CHANNEL_ID = 1529091178945839164          # Logs channel ID
 CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782  # Channel where an embed is posted to notify the creator their report is closed
 SETUP_COMMAND = "!setup_report_button"         # Text command (staff only) to (re)post the "Create Report" panel
@@ -35,7 +37,6 @@ def append_history(embed: discord.Embed, line: str):
         existing = embed.fields[history_index].value
         new_value = f"{existing}\n{line}"
         if len(new_value) > MAX_HISTORY_FIELD_LEN:
-            # Trim oldest lines so we stay under Discord's field length limit
             lines = new_value.split("\n")
             while len("\n".join(lines)) > MAX_HISTORY_FIELD_LEN and len(lines) > 1:
                 lines.pop(0)
@@ -48,21 +49,6 @@ def get_history(embed: discord.Embed) -> str:
         if field.name == "History":
             return field.value
     return "No actions recorded."
-
-
-def build_report_embed(creator: discord.abc.User) -> discord.Embed:
-    """Build the standard 'new report' embed. Stores the creator's ID in a
-    parse-friendly format so it can be recovered later (e.g. on close) even
-    if the thread's actual Discord 'owner' ends up being the bot."""
-    role = None
-    embed = discord.Embed(
-        title="New Game Report - Awaiting Action",
-        description="Please check this game report",
-        color=discord.Color.blurple(),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
-    return embed
 
 
 def extract_creator_id(embed: discord.Embed):
@@ -83,6 +69,13 @@ async def resolve_member(guild: discord.Guild, user_id: int):
         except Exception:
             member = None
     return member
+
+
+def make_channel_name(user: discord.abc.User) -> str:
+    base = re.sub(r"[^a-z0-9-]", "", user.display_name.lower().replace(" ", "-"))
+    if not base:
+        base = "user"
+    return f"report-{base}-{str(user.id)[-4:]}"[:100]
 
 
 class ReasonModal(discord.ui.Modal):
@@ -127,79 +120,121 @@ class ThreadStatusView(discord.ui.View):
         await interaction.response.send_modal(ReasonModal("🔴", "No action"))
 
 
+class ReportModal(discord.ui.Modal, title="Create Report"):
+    reason_input = discord.ui.TextInput(
+        label="Reason",
+        style=discord.TextStyle.paragraph,
+        placeholder="Explain what happened...",
+        required=True,
+        max_length=1000,
+    )
+    video_input = discord.ui.TextInput(
+        label="Video clip link",
+        style=discord.TextStyle.short,
+        placeholder="Paste a link — or leave blank if you'll upload a clip in the channel instead",
+        required=False,
+        max_length=300,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await create_report_channel(interaction, self.reason_input.value, self.video_input.value)
+
+
 class CreateReportView(discord.ui.View):
-    """Posted once in THREAD_CHANNEL_ID. Anyone can click it to open a new
-    report thread, get the standard embed + status buttons, and receive the
-    reporter role for the duration of the report."""
+    """Posted once in PANEL_CHANNEL_ID. Anyone can click it to open a report,
+    fill in a reason + video link/clip, and get a private channel with staff."""
 
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Create Report", emoji="📝", style=discord.ButtonStyle.primary, custom_id="report:create")
     async def create_report(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.send_modal(ReportModal())
 
-        channel = interaction.channel
+
+async def create_report_channel(interaction: discord.Interaction, reason: str, video_link: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    guild = interaction.guild
+    creator = interaction.user
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        creator: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_permissions=True, read_message_history=True),
+    }
+    staff_role = guild.get_role(STAFF_ROLE_ID)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+    category = guild.get_channel(REPORTS_CATEGORY_ID) if REPORTS_CATEGORY_ID else None
+
+    try:
+        channel = await guild.create_text_channel(
+            name=make_channel_name(creator),
+            category=category,
+            overwrites=overwrites,
+            reason=f"Report opened by {creator} ({creator.id})",
+        )
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Couldn't create a report channel: {e}", ephemeral=True)
+        return
+
+    role = guild.get_role(ROLE_ID_TO_PING)
+    ping = role.mention if role else None
+
+    embed = discord.Embed(
+        title="New Game Report - Awaiting Action",
+        description="Please check this game report",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    if video_link:
+        embed.add_field(name="Video", value=video_link, inline=False)
+    else:
+        embed.add_field(name="Video", value="⚠️ No link provided — waiting on an uploaded clip below.", inline=False)
+
+    view = ThreadStatusView()
+    await channel.send(content=f"{ping} {creator.mention}".strip() if ping else creator.mention, embed=embed, view=view)
+
+    if not video_link:
+        await channel.send("📎 Please upload your video clip here as an attachment to complete your report.")
+
+    reporter_role = guild.get_role(REPORTER_ROLE_ID)
+    if reporter_role:
         try:
-            thread = await channel.create_thread(
-                name=f"Report - {interaction.user.display_name}"[:100],
-                type=discord.ChannelType.public_thread,
-                reason=f"Report opened by {interaction.user} ({interaction.user.id})",
-            )
+            await creator.add_roles(reporter_role, reason="Opened a report")
         except Exception as e:
-            await interaction.followup.send(f"⚠️ Couldn't create a thread: {e}", ephemeral=True)
-            return
+            print(f"⚠️ Failed to add reporter role: {e}")
 
-        role = interaction.guild.get_role(ROLE_ID_TO_PING)
-        ping = role.mention if role else None
-
-        embed = build_report_embed(interaction.user)
-        view = ThreadStatusView()
-        await thread.send(content=ping, embed=embed, view=view)
-
-        try:
-            await thread.add_user(interaction.user)
-        except Exception:
-            pass
-
-        # Assign the reporter role for the duration of the report
-        reporter_role = interaction.guild.get_role(REPORTER_ROLE_ID)
-        if reporter_role:
-            try:
-                await interaction.user.add_roles(reporter_role, reason="Opened a report thread")
-            except Exception as e:
-                print(f"⚠️ Failed to add reporter role: {e}")
-
-        await interaction.followup.send(f"✅ Your report thread has been created: {thread.mention}", ephemeral=True)
+    await interaction.followup.send(f"✅ Your report channel has been created: {channel.mention}", ephemeral=True)
 
 
 async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None):
-    thread = interaction.channel
+    channel = interaction.channel
     closer = interaction.user
-    message = interaction.message  # Works for both button clicks and modal submits from a component
+    message = interaction.message
 
-    # Acknowledge the interaction. Modal submits need a "thinking" defer since they
-    # aren't directly tied to editing the original message the way component clicks are.
     is_modal_submit = interaction.type == discord.InteractionType.modal_submit
     if is_modal_submit:
         await interaction.response.defer(ephemeral=True, thinking=True)
     else:
         await interaction.response.defer()
 
-    # Update thread name
-    if isinstance(thread, discord.Thread):
-        new_name = f"{emoji} {thread.name.lstrip('🔵🟢🔴 ')}"
-        try:
-            await thread.edit(name=new_name[:100])
-        except:
-            pass
+    # Update channel name
+    new_name = f"{emoji}-{channel.name.lstrip('🔵🟢🔴-')}"
+    try:
+        await channel.edit(name=new_name[:100])
+    except:
+        pass
 
     # Update embed
     embed = message.embeds[0]
     embed.title = f"{emoji} {status}"
     embed.set_footer(text=f"Last action by: {closer} ({closer.id})")
 
-    # Append this action to the History field
     history_line = f"{emoji} **{status}** by {closer.mention}"
     if reason:
         history_line += f" — {reason}"
@@ -211,7 +246,6 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
     if is_modal_submit:
         await interaction.followup.send(f"✅ Report marked as **{status}**.", ephemeral=True)
 
-    # If closing the report
     if delete:
         creator_id = extract_creator_id(embed)
         creator_member = await resolve_member(interaction.guild, creator_id) if creator_id else None
@@ -231,7 +265,7 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         if closed_channel:
             notify_embed = discord.Embed(
                 title=f"{emoji} Report Closed: {status}",
-                description=f"{creator_mention}, your report **{thread.name}** has been closed.",
+                description=f"{creator_mention}, your report **{channel.name}** has been closed.",
                 color=discord.Color.green() if status == "Handled" else discord.Color.red(),
                 timestamp=discord.utils.utcnow(),
             )
@@ -245,12 +279,12 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         else:
             print(f"⚠️ CLOSED_REPORTS_CHANNEL_ID ({CLOSED_REPORTS_CHANNEL_ID}) not found in guild.")
 
-        # Send to logs channel, including the full action history
+        # Send to logs channel, including the full action history and a link to the channel
         logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
         if logs_channel:
             log_embed = discord.Embed(
                 title="Report Closed",
-                description=f"**Thread:** [{thread.name}]({thread.jump_url})\n**Final status:** {status}\n**Closed by:** {closer.mention}",
+                description=f"**Channel:** {channel.mention}\n**Final status:** {status}\n**Closed by:** {closer.mention}",
                 color=discord.Color.green() if status == "Handled" else discord.Color.red(),
                 timestamp=discord.utils.utcnow(),
             )
@@ -260,12 +294,17 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
             log_embed.add_field(name="History", value=get_history(embed), inline=False)
             await logs_channel.send(embed=log_embed)
 
-        # Archive (and lock) the thread instead of deleting it, so the history is preserved
+        # Lock the channel down instead of deleting it — reporter keeps read access, loses send access
         await asyncio.sleep(3)
         try:
-            await thread.edit(archived=True, locked=True)
+            if creator_member:
+                await channel.set_permissions(creator_member, view_channel=True, send_messages=False, reason="Report closed")
+            if CLOSED_CATEGORY_ID:
+                closed_category = interaction.guild.get_channel(CLOSED_CATEGORY_ID)
+                if closed_category:
+                    await channel.edit(category=closed_category, reason="Report closed")
         except Exception as e:
-            print(f"⚠️ Failed to archive thread: {e}")
+            print(f"⚠️ Failed to lock down closed report channel: {e}")
 
 
 @bot.event
@@ -286,8 +325,8 @@ async def on_message(message: discord.Message):
             return
         panel_embed = discord.Embed(
             title="📝 Submit a Game Report",
-            description="Click the button below to open a private report thread. "
-                        "A staff member will be with you shortly.",
+            description="Click the button below to open a private report channel. "
+                        "You'll be asked for a reason and a video link/clip.",
             color=discord.Color.blurple(),
         )
         await message.channel.send(embed=panel_embed, view=CreateReportView())
@@ -295,39 +334,6 @@ async def on_message(message: discord.Message):
             await message.delete()
         except Exception:
             pass
-
-
-@bot.event
-async def on_thread_create(thread: discord.Thread):
-    # Only handle the configured channel, and skip threads the bot itself
-    # created via the "Create Report" button (those are already handled there).
-    if thread.parent_id != THREAD_CHANNEL_ID:
-        return
-    if thread.owner_id == bot.user.id:
-        return
-
-    role = thread.guild.get_role(ROLE_ID_TO_PING)
-    ping = role.mention if role else "@here"
-    creator = thread.owner if thread.owner else None
-
-    embed = build_report_embed(creator) if creator else discord.Embed(
-        title="New Game Report - Awaiting Action",
-        description="Please check this game report",
-        color=discord.Color.blurple(),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.description = f"{ping}, Please check this game report"
-    view = ThreadStatusView()
-    await thread.send(embed=embed, view=view)
-
-    # Manually-created threads also grant the reporter role
-    if creator:
-        reporter_role = thread.guild.get_role(REPORTER_ROLE_ID)
-        if reporter_role:
-            try:
-                await creator.add_roles(reporter_role, reason="Opened a report thread")
-            except Exception as e:
-                print(f"⚠️ Failed to add reporter role: {e}")
 
 
 # Web server
