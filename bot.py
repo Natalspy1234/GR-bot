@@ -47,6 +47,13 @@ def append_history(embed: discord.Embed, line: str):
             new_value = "\n".join(lines)
         embed.set_field_at(history_index, name="History", value=new_value, inline=False)
 
+def remove_history_field(embed: discord.Embed):
+    """Remove History field when reopening"""
+    for i, field in enumerate(embed.fields):
+        if field.name == "History":
+            embed.remove_field(i)
+            break
+
 def get_history(embed: discord.Embed) -> str:
     for field in embed.fields:
         if field.name == "History":
@@ -84,7 +91,6 @@ def make_channel_name(reason: str, user: discord.abc.User) -> str:
     return f"{slug}-{str(user.id)[-4:]}"[:100]
 
 
-# ====================== REOPEN MODAL ======================
 class ReopenReasonModal(discord.ui.Modal, title="Reopen Report"):
     def __init__(self):
         super().__init__()
@@ -101,7 +107,6 @@ class ReopenReasonModal(discord.ui.Modal, title="Reopen Report"):
         await handle_reopen(interaction, self.reason_input.value)
 
 
-# ====================== VIEWS ======================
 class ThreadStatusView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -176,7 +181,7 @@ async def handle_reopen(interaction: discord.Interaction, reason: str):
 
     closer_name = closer_member.mention if closer_member else "Unknown Staff"
 
-    # Restore permissions and role
+    # Restore permissions & role
     if creator_member:
         reporter_role = interaction.guild.get_role(REPORTER_ROLE_ID)
         if reporter_role:
@@ -185,52 +190,126 @@ async def handle_reopen(interaction: discord.Interaction, reason: str):
             except:
                 pass
         try:
-            await channel.set_permissions(creator_member, view_channel=True, send_messages=True, reason="Report reopened")
+            await channel.set_permissions(creator_member, view_channel=True, send_messages=True)
         except:
             pass
 
-    # Move to open category + reset name to yellow
+    # Move back + reset to yellow
     try:
         if REPORTS_CATEGORY_ID:
-            await channel.edit(category=interaction.guild.get_channel(REPORTS_CATEGORY_ID), reason="Report reopened")
+            await channel.edit(category=interaction.guild.get_channel(REPORTS_CATEGORY_ID))
         new_name = f"🟡-{channel.name.lstrip('🟡🔵🟢🔴-')}"
         await channel.edit(name=new_name[:100])
-    except Exception as e:
-        print(f"⚠️ Rename/move failed: {e}")
+    except:
+        pass
 
-    # Update embed
+    # Update embed - remove history when reopened
     embed.title = "🟡 Reopened - Awaiting Action"
     embed.set_footer(text=f"Reopened by: {reopener} ({reopener.id})")
+    remove_history_field(embed)
     append_history(embed, f"🟡 **Reopened** by {reopener.mention} — {reason} (<t:{int(discord.utils.utcnow().timestamp())}:R>)")
 
-    # Restore status buttons
     view = ThreadStatusView()
     await message.edit(embed=embed, view=view)
 
-    # Send notification using your exact message
+    # Notification in channel
     notify_msg = f"Hey {creator_member.mention if creator_member else f'<@{creator_id}>'}, your report that was closed by {closer_name} has been re opened by a high ranking staff member. the reason behind this is {reason}"
-
     await channel.send(notify_msg)
 
-    # Log to logs channel
-    logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
-    if logs_channel:
-        await logs_channel.send(f"🔓 {channel.mention} was reopened by {reopener.mention} | Reason: {reason}")
+    # Log
+    if logs := interaction.guild.get_channel(LOGS_CHANNEL_ID):
+        await logs.send(f"🔓 {channel.mention} reopened by {reopener.mention} | Reason: {reason}")
 
-    await interaction.followup.send("✅ Report reopened successfully.", ephemeral=True)
+    await interaction.followup.send("✅ Report reopened.", ephemeral=True)
 
 
-# ====================== REMAINING CODE (unchanged) ======================
-# ... [All the other functions and classes remain the same as previous full code] ...
+# ====================== CLOSE HANDLER ======================
+async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None):
+    channel = interaction.channel
+    closer = interaction.user
+    message = interaction.message
+    is_modal = interaction.type == discord.InteractionType.modal_submit
 
-REASON_OPTIONS = [
-    ("RDM", "rdm"),
-    ("VDM", "vdm"),
-    ("GTA Driving", "gta_driving"),
-    ("Other", "other"),
-]
+    if is_modal:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    else:
+        await interaction.response.defer()
+
+    # Update name
+    new_name = f"{emoji}-{channel.name.lstrip('🟡🔵🟢🔴-')}"
+    try:
+        await channel.edit(name=new_name[:100])
+    except:
+        pass
+
+    embed = message.embeds[0]
+    embed.title = f"{emoji} {status}"
+    embed.set_footer(text=f"Last action by: {closer} ({closer.id})")
+
+    history_line = f"{emoji} **{status}** by {closer.mention}"
+    if reason:
+        history_line += f" — {reason}"
+    history_line += f" (<t:{int(discord.utils.utcnow().timestamp())}:R>)"
+    append_history(embed, history_line)
+
+    await message.edit(embed=embed)
+
+    if is_modal:
+        await interaction.followup.send(f"✅ Report marked as **{status}**.", ephemeral=True)
+
+    if delete:
+        creator_id = extract_creator_id(embed)
+        creator_member = await resolve_member(interaction.guild, creator_id) if creator_id else None
+        creator_mention = creator_member.mention if creator_member else f"<@{creator_id}>"
+
+        # Remove reporter role
+        if creator_member and (r_role := interaction.guild.get_role(REPORTER_ROLE_ID)):
+            try:
+                await creator_member.remove_roles(r_role)
+            except:
+                pass
+
+        # === ALWAYS DM THE CREATOR ON CLOSE ===
+        if creator_member:
+            try:
+                dm_embed = discord.Embed(
+                    title=f"{emoji} Your Report Has Been Closed",
+                    description=f"Your report **{channel.name}** has been closed as **{status}**.",
+                    color=discord.Color.green() if status == "Handled" else discord.Color.red(),
+                    timestamp=discord.utils.utcnow()
+                )
+                dm_embed.add_field(name="Closed by", value=closer.mention, inline=True)
+                if reason:
+                    dm_embed.add_field(name="Reason", value=reason, inline=False)
+                await creator_member.send(embed=dm_embed)
+            except Exception as e:
+                print(f"⚠️ Failed to DM creator: {e}")
+                # Fallback to closed reports channel
+                if fallback := interaction.guild.get_channel(CLOSED_REPORTS_CHANNEL_ID):
+                    try:
+                        await fallback.send(content=creator_mention, embed=dm_embed)
+                    except:
+                        pass
+
+        # Move to closed category + swap to Reopen button
+        await asyncio.sleep(2)
+        try:
+            if CLOSED_CATEGORY_ID:
+                await channel.edit(category=interaction.guild.get_channel(CLOSED_CATEGORY_ID))
+            await message.edit(view=ReopenView())
+        except Exception as e:
+            print(f"Close error: {e}")
+
+        # Logs (optional - you can expand if needed)
+        if logs := interaction.guild.get_channel(LOGS_CHANNEL_ID):
+            await logs.send(f"📴 {channel.mention} closed as {status} by {closer.mention}")
+
+
+# ====================== CREATE REPORT ======================
+# (Rest of the code - Create Report, Setup, etc.)
+
+REASON_OPTIONS = [("RDM", "rdm"), ("VDM", "vdm"), ("GTA Driving", "gta_driving"), ("Other", "other")]
 REASON_LABELS = {value: label for label, value in REASON_OPTIONS}
-
 
 class OtherReasonModal(discord.ui.Modal, title="Report Details"):
     def __init__(self, selected_values):
@@ -306,22 +385,28 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
             name=f"🟡-{make_channel_name(reason, creator)}",
             category=category,
             overwrites=overwrites,
-            reason=f"Report opened by {creator}",
+            reason=f"Report by {creator}",
         )
     except Exception as e:
-        await interaction.followup.send(f"⚠️ Couldn't create channel: {e}", ephemeral=True)
+        await interaction.followup.send(f"⚠️ Failed to create channel: {e}", ephemeral=True)
         return
 
-    ping = guild.get_role(ROLE_ID_TO_PING).mention if guild.get_role(ROLE_ID_TO_PING) else ""
+    ping_role = guild.get_role(ROLE_ID_TO_PING)
+    ping = ping_role.mention if ping_role else ""
 
-    embed = discord.Embed(title="New Game Report - Awaiting Action", description="Please check this game report", color=discord.Color.blurple(), timestamp=discord.utils.utcnow())
+    embed = discord.Embed(
+        title="New Game Report - Awaiting Action",
+        description="Please check this game report",
+        color=discord.Color.blurple(),
+        timestamp=discord.utils.utcnow()
+    )
     embed.set_image(url=REPORT_THUMBNAIL_URL)
     embed.add_field(name="Created by", value=f"{creator.mention} (`{creator.id}`)", inline=True)
     embed.add_field(name="Reason", value=reason, inline=False)
     if video_link:
         embed.add_field(name="Video", value=video_link, inline=False)
     else:
-        embed.add_field(name="Video", value="⚠️ No link provided — waiting on an uploaded clip below.", inline=False)
+        embed.add_field(name="Video", value="⚠️ No link provided — waiting on clip.", inline=False)
 
     await channel.send(content=f"{ping} {creator.mention}".strip(), embed=embed, view=ThreadStatusView())
 
@@ -335,58 +420,6 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
             pass
 
     await interaction.followup.send(f"✅ Report created: {channel.mention}", ephemeral=True)
-
-
-async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None):
-    # ... (keeping the original handle_status_update logic - it's long, but unchanged except for name reset already handled in reopen)
-    channel = interaction.channel
-    closer = interaction.user
-    message = interaction.message
-    is_modal = interaction.type == discord.InteractionType.modal_submit
-
-    if is_modal:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    else:
-        await interaction.response.defer()
-
-    new_name = f"{emoji}-{channel.name.lstrip('🟡🔵🟢🔴-')}"
-    try:
-        await channel.edit(name=new_name[:100])
-    except:
-        pass
-
-    embed = message.embeds[0]
-    embed.title = f"{emoji} {status}"
-    embed.set_footer(text=f"Last action by: {closer} ({closer.id})")
-    history_line = f"{emoji} **{status}** by {closer.mention}"
-    if reason:
-        history_line += f" — {reason}"
-    history_line += f" (<t:{int(discord.utils.utcnow().timestamp())}:R>)"
-    append_history(embed, history_line)
-
-    await message.edit(embed=embed)
-
-    if is_modal:
-        await interaction.followup.send(f"✅ Report marked as **{status}**.", ephemeral=True)
-
-    if delete:
-        # [Your original closing logic remains here - I kept it minimal for brevity]
-        creator_id = extract_creator_id(embed)
-        creator_member = await resolve_member(interaction.guild, creator_id) if creator_id else None
-
-        if creator_member and (reporter_role := interaction.guild.get_role(REPORTER_ROLE_ID)):
-            try:
-                await creator_member.remove_roles(reporter_role)
-            except:
-                pass
-
-        await asyncio.sleep(2)
-        try:
-            await message.edit(view=ReopenView())
-            if CLOSED_CATEGORY_ID:
-                await channel.edit(category=interaction.guild.get_channel(CLOSED_CATEGORY_ID))
-        except Exception as e:
-            print(f"Close error: {e}")
 
 
 @bot.event
