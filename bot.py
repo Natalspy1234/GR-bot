@@ -2,6 +2,7 @@ import discord
 import os
 import re
 import asyncio
+from datetime import datetime, timezone
 from aiohttp import web
 # ========================= CONFIG =========================
 PANEL_CHANNEL_ID = 1529103880506310918         # Channel where the "Create Report" button/panel lives
@@ -70,6 +71,33 @@ async def resolve_member(guild: discord.Guild, user_id: int):
         except Exception:
             member = None
     return member
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def extract_first_being_handled_ts(history_text: str):
+    """Find the timestamp of the first time this report was marked 'Being handled'."""
+    for line in history_text.split("\n"):
+        if "Being handled" in line:
+            match = re.search(r"<t:(\d+):R>", line)
+            if match:
+                return int(match.group(1))
+    return None
 
 
 def make_channel_name(reason: str, user: discord.abc.User) -> str:
@@ -232,7 +260,7 @@ async def create_report_channel(interaction: discord.Interaction, reason: str, v
 
     try:
         channel = await guild.create_text_channel(
-            name=make_channel_name(reason, creator),
+            name=f"🟡-{make_channel_name(reason, creator)}",
             category=category,
             overwrites=overwrites,
             reason=f"Report opened by {creator} ({creator.id})",
@@ -286,7 +314,7 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         await interaction.response.defer()
 
     # Update channel name
-    new_name = f"{emoji}-{channel.name.lstrip('🔵🟢🔴-')}"
+    new_name = f"{emoji}-{channel.name.lstrip('🟡🔵🟢🔴-')}"
     try:
         await channel.edit(name=new_name[:100])
     except:
@@ -353,6 +381,21 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
             log_embed.add_field(name="Original Creator", value=creator_mention, inline=False)
             if reason:
                 log_embed.add_field(name="Closing Reason", value=reason, inline=False)
+
+            # How long the report sat pending before it was first marked "Being handled"
+            # (or, if it was never marked that, before it was closed)
+            pending_start = embed.timestamp
+            if pending_start:
+                being_handled_ts = extract_first_being_handled_ts(get_history(embed))
+                pending_end = (
+                    datetime.fromtimestamp(being_handled_ts, tz=timezone.utc)
+                    if being_handled_ts
+                    else discord.utils.utcnow()
+                )
+                pending_seconds = (pending_end - pending_start).total_seconds()
+                label = "Time to first response" if being_handled_ts else "Time pending (never marked 'Being handled')"
+                log_embed.add_field(name=label, value=format_duration(pending_seconds), inline=False)
+
             log_embed.add_field(name="History", value=get_history(embed), inline=False)
             await logs_channel.send(embed=log_embed)
 
