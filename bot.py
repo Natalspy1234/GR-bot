@@ -10,9 +10,10 @@ REPORTS_CATEGORY_ID = 1477260121339072532      # Category new report channels ar
 CLOSED_CATEGORY_ID = 1529247109537202337       # Category closed report channels get moved into
 ROLE_ID_TO_PING = 1529040758286450819          # Role that gets pinged on new report channel
 STAFF_ROLE_ID = 1477457940553138349            # Role allowed to view report channels / use the status buttons
+REOPEN_ROLE_ID = 1477262472942587967           # Role allowed to reopen a closed report
 REPORTER_ROLE_ID = 1529103473696575498         # Role given to a report creator while their report channel is open
 LOGS_CHANNEL_ID = 1529091178945839164          # Logs channel ID
-CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782  # Channel where an embed is posted to notify the creator their report is closed
+CLOSED_REPORTS_CHANNEL_ID = 1529096698201116782  # Fallback channel used only if DMing the report creator fails (e.g. their DMs are closed)
 SETUP_COMMAND = "!setup_report_button"         # Text command (staff only) to (re)post the "Create Report" panel
 REPORT_THUMBNAIL_URL = "https://cdn.discordapp.com/attachments/1477262109480980621/1529247992521953380/game_reposts_banner.png"  # Thumbnail shown on report embeds
 # =======================================================
@@ -60,6 +61,15 @@ def extract_creator_id(embed: discord.Embed):
             match = re.search(r"`(\d+)`", field.value)
             if match:
                 return int(match.group(1))
+    return None
+
+
+def extract_footer_id(embed: discord.Embed):
+    """Pull a user ID back out of the embed footer, e.g. 'Last action by: Name (123456)'."""
+    if embed.footer and embed.footer.text:
+        match = re.search(r"\((\d+)\)", embed.footer.text)
+        if match:
+            return int(match.group(1))
     return None
 
 
@@ -147,6 +157,96 @@ class ThreadStatusView(discord.ui.View):
     @discord.ui.button(label="No action", style=discord.ButtonStyle.danger, custom_id="thread:no_action")
     async def no_action(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(ReasonModal("🔴", "No action"))
+
+
+class ReopenView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        reopen_role = interaction.guild.get_role(REOPEN_ROLE_ID)
+        if reopen_role and reopen_role in interaction.user.roles:
+            return True
+        await interaction.response.send_message("❌ You don't have permission to reopen this report.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="Reopen", emoji="🔓", style=discord.ButtonStyle.secondary, custom_id="thread:reopen")
+    async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await reopen_report(interaction)
+
+
+async def reopen_report(interaction: discord.Interaction):
+    channel = interaction.channel
+    message = interaction.message
+    reopener = interaction.user
+    embed = message.embeds[0]
+
+    await interaction.response.defer()
+
+    creator_id = extract_creator_id(embed)
+    creator_member = await resolve_member(interaction.guild, creator_id) if creator_id else None
+    closer_id = extract_footer_id(embed)  # who closed it — grab before we overwrite the footer below
+    closer_member = await resolve_member(interaction.guild, closer_id) if closer_id else None
+
+    # Restore the reporter role and their send access
+    if creator_member:
+        reporter_role = interaction.guild.get_role(REPORTER_ROLE_ID)
+        if reporter_role and reporter_role not in creator_member.roles:
+            try:
+                await creator_member.add_roles(reporter_role, reason="Report reopened")
+            except Exception as e:
+                print(f"⚠️ Failed to re-add reporter role: {e}")
+        try:
+            await channel.set_permissions(creator_member, view_channel=True, send_messages=True, reason="Report reopened")
+        except Exception as e:
+            print(f"⚠️ Failed to restore send permissions: {e}")
+
+    # Move it back to the open reports category
+    try:
+        if REPORTS_CATEGORY_ID:
+            open_category = interaction.guild.get_channel(REPORTS_CATEGORY_ID)
+            if open_category:
+                await channel.edit(category=open_category, reason="Report reopened")
+    except Exception as e:
+        print(f"⚠️ Failed to move channel back to open category: {e}")
+
+    # Rename back to pending
+    try:
+        new_name = f"🟡-{channel.name.lstrip('🟡🔵🟢🔴-')}"
+        await channel.edit(name=new_name[:100])
+    except Exception as e:
+        print(f"⚠️ Failed to rename channel on reopen: {e}")
+
+    # Update embed + swap the view back to the normal status buttons
+    embed.title = "🟡 Reopened - Awaiting Action"
+    embed.set_footer(text=f"Reopened by: {reopener} ({reopener.id})")
+    append_history(embed, f"🟡 **Reopened** by {reopener.mention} (<t:{int(discord.utils.utcnow().timestamp())}:R>)")
+    await message.edit(embed=embed, view=ThreadStatusView())
+
+    logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
+    if logs_channel:
+        try:
+            await logs_channel.send(f"🔓 {channel.mention} was reopened by {reopener.mention}.")
+        except Exception as e:
+            print(f"⚠️ Failed to send reopen log: {e}")
+
+    if closer_member:
+        try:
+            await closer_member.send(
+                f"🔓 A report you closed — **{channel.name}** ({channel.mention}) — has been reopened by management."
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to DM closer about reopen: {e}")
+
+    if creator_member:
+        try:
+            await creator_member.send(
+                f"🔓 Your report — **{channel.name}** ({channel.mention}) — has been reopened by management."
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to DM creator about reopen: {e}")
+
+    await interaction.followup.send("✅ Report reopened.", ephemeral=True)
 
 
 REASON_OPTIONS = [
@@ -350,24 +450,32 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
                 except Exception as e:
                     print(f"⚠️ Failed to remove reporter role: {e}")
 
-        # Notify in the closed-reports channel
-        closed_channel = interaction.guild.get_channel(CLOSED_REPORTS_CHANNEL_ID)
-        if closed_channel:
-            notify_embed = discord.Embed(
-                title=f"{emoji} Report Closed: {status}",
-                description=f"{creator_mention}, your report **{channel.name}** has been closed.",
-                color=discord.Color.green() if status == "Handled" else discord.Color.red(),
-                timestamp=discord.utils.utcnow(),
-            )
-            notify_embed.add_field(name="Closed by", value=closer.mention, inline=True)
-            if reason:
-                notify_embed.add_field(name="Reason", value=reason, inline=False)
+        # DM the creator that their report is closed (fall back to the channel only if the DM fails, e.g. DMs disabled)
+        notify_embed = discord.Embed(
+            title=f"{emoji} Report Closed: {status}",
+            description=f"Your report **{channel.name}** has been closed.",
+            color=discord.Color.green() if status == "Handled" else discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+        notify_embed.add_field(name="Closed by", value=closer.mention, inline=True)
+        if reason:
+            notify_embed.add_field(name="Reason", value=reason, inline=False)
+
+        dm_sent = False
+        if creator_member:
             try:
-                await closed_channel.send(content=creator_mention, embed=notify_embed)
+                await creator_member.send(embed=notify_embed)
+                dm_sent = True
             except Exception as e:
-                print(f"⚠️ Failed to send closed-report notification: {e}")
-        else:
-            print(f"⚠️ CLOSED_REPORTS_CHANNEL_ID ({CLOSED_REPORTS_CHANNEL_ID}) not found in guild.")
+                print(f"⚠️ Failed to DM report creator: {e}")
+
+        if not dm_sent:
+            closed_channel = interaction.guild.get_channel(CLOSED_REPORTS_CHANNEL_ID)
+            if closed_channel:
+                try:
+                    await closed_channel.send(content=creator_mention, embed=notify_embed)
+                except Exception as e:
+                    print(f"⚠️ Failed to send closed-report fallback notification: {e}")
 
         # Send to logs channel, including the full action history and a link to the channel
         logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
@@ -411,11 +519,18 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         except Exception as e:
             print(f"⚠️ Failed to lock down closed report channel: {e}")
 
+        # Swap the status buttons out for a single "Reopen" button, gated to REOPEN_ROLE_ID
+        try:
+            await message.edit(view=ReopenView())
+        except Exception as e:
+            print(f"⚠️ Failed to swap in the reopen button: {e}")
+
 
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
     bot.add_view(ThreadStatusView())
+    bot.add_view(ReopenView())
     bot.add_view(CreateReportView())
     asyncio.create_task(run_web())
 
