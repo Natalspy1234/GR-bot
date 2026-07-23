@@ -92,13 +92,19 @@ def make_channel_name(reason: str, user: discord.abc.User) -> str:
 
 # ====================== MODALS & VIEWS ======================
 class ReopenReasonModal(discord.ui.Modal, title="Reopen Report"):
-    def __init__(self):
+    def __init__(self, message: discord.Message):
         super().__init__()
+        # Captured from the button click, not relied on from the modal-submit
+        # interaction, since Interaction.message is not always populated
+        # reliably on modal submissions once a message has already been
+        # edited/had its view swapped once before (this was the cause of
+        # "can't re-close after reopen").
+        self.message = message
         self.reason_input = discord.ui.TextInput(label="Reason for reopening", style=discord.TextStyle.paragraph, required=True, max_length=500)
         self.add_item(self.reason_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await handle_reopen(interaction, self.reason_input.value)
+        await handle_reopen(interaction, self.reason_input.value, self.message)
 
 
 class ThreadStatusView(discord.ui.View):
@@ -113,15 +119,15 @@ class ThreadStatusView(discord.ui.View):
 
     @discord.ui.button(label="Being handled", style=discord.ButtonStyle.primary, custom_id="thread:being_handled")
     async def being_handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_status_update(interaction, "🔵", "Being handled", delete=False)
+        await handle_status_update(interaction, "🔵", "Being handled", delete=False, message=interaction.message)
 
     @discord.ui.button(label="Handled", style=discord.ButtonStyle.success, custom_id="thread:handled")
     async def handled(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ReasonModal("🟢", "Handled"))
+        await interaction.response.send_modal(ReasonModal("🟢", "Handled", interaction.message))
 
     @discord.ui.button(label="No action", style=discord.ButtonStyle.danger, custom_id="thread:no_action")
     async def no_action(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ReasonModal("🔴", "No action"))
+        await interaction.response.send_modal(ReasonModal("🔴", "No action", interaction.message))
 
 
 class ReopenView(discord.ui.View):
@@ -136,25 +142,30 @@ class ReopenView(discord.ui.View):
 
     @discord.ui.button(label="Reopen", emoji="🔓", style=discord.ButtonStyle.secondary, custom_id="thread:reopen")
     async def reopen(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(ReopenReasonModal())
+        await interaction.response.send_modal(ReopenReasonModal(interaction.message))
 
 
 class ReasonModal(discord.ui.Modal):
-    def __init__(self, emoji: str, status: str):
+    def __init__(self, emoji: str, status: str, message: discord.Message):
         super().__init__(title=f"Reason: {status}")
         self.emoji = emoji
         self.status = status
+        # Same fix as ReopenReasonModal above - capture the message at
+        # button-click time instead of trusting interaction.message later.
+        self.message = message
         self.reason_input = discord.ui.TextInput(label="Reason", style=discord.TextStyle.paragraph, required=True, max_length=500)
         self.add_item(self.reason_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        await handle_status_update(interaction, self.emoji, self.status, delete=True, reason=self.reason_input.value)
+        await handle_status_update(interaction, self.emoji, self.status, delete=True, reason=self.reason_input.value, message=self.message)
 
 
 # ====================== REOPEN ======================
-async def handle_reopen(interaction: discord.Interaction, reason: str):
+async def handle_reopen(interaction: discord.Interaction, reason: str, message: discord.Message = None):
     channel = interaction.channel
-    message = interaction.message
+    # Prefer the message captured at button-click time; fall back to
+    # interaction.message just in case (e.g. if called from a non-modal path).
+    message = message or interaction.message
     reopener = interaction.user
     embed = message.embeds[0]
 
@@ -172,35 +183,58 @@ async def handle_reopen(interaction: discord.Interaction, reason: str):
             if r := interaction.guild.get_role(REPORTER_ROLE_ID):
                 await creator_member.add_roles(r)
             await channel.set_permissions(creator_member, view_channel=True, send_messages=True)
-        except:
-            pass
+        except Exception as e:
+            print(f"Reopen permission restore error: {e}")
 
     try:
         if REPORTS_CATEGORY_ID:
             await channel.edit(category=interaction.guild.get_channel(REPORTS_CATEGORY_ID))
         new_name = f"🟡-{channel.name.lstrip('🟡🔵🟢🔴-')}"
         await channel.edit(name=new_name[:100])
-    except:
-        pass
+    except Exception as e:
+        print(f"Reopen channel edit error: {e}")
 
     embed.title = "🟡 Reopened - Awaiting Action"
     embed.set_footer(text=f"Reopened by: {reopener} ({reopener.id})")
     remove_history_field(embed)
-    append_history(embed, f"🟡 **Reopened** by {reopener.mention} — {reason} (<t:{int(discord.utils.utcnow().timestamp())}:R>)")
+    reopened_ts = int(discord.utils.utcnow().timestamp())
+    append_history(embed, f"🟡 **Reopened** by {reopener.mention} — {reason} (<t:{reopened_ts}:R>)")
 
     await message.edit(embed=embed, view=ThreadStatusView())
 
     creator_mention = creator_member.mention if creator_member else f"<@{creator_id}>"
     await channel.send(f"Hey {creator_mention}, your report that was closed by {closer_name} has been re opened by a high ranking staff member. the reason behind this is {reason}")
 
+    # === LOGS EMBED FOR REOPEN ===
+    logs_channel = interaction.guild.get_channel(LOGS_CHANNEL_ID)
+    if logs_channel:
+        log_embed = discord.Embed(
+            title="Report Reopened",
+            color=discord.Color.gold(),
+            timestamp=discord.utils.utcnow()
+        )
+        log_embed.add_field(name="Channel", value=channel.mention, inline=False)
+        log_embed.add_field(name="Reopened by", value=reopener.mention, inline=False)
+        log_embed.add_field(name="Original Creator", value=creator_mention, inline=False)
+        log_embed.add_field(name="Previously closed by", value=closer_name, inline=False)
+        log_embed.add_field(name="Reopen Reason", value=reason, inline=False)
+        log_embed.add_field(name="History", value=get_history(embed), inline=False)
+
+        try:
+            await logs_channel.send(embed=log_embed)
+        except Exception as e:
+            print(f"Reopen logs embed failed: {e}")
+
     await interaction.followup.send("✅ Report reopened.", ephemeral=True)
 
 
 # ====================== CLOSE / STATUS UPDATE ======================
-async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None):
+async def handle_status_update(interaction: discord.Interaction, emoji: str, status: str, delete: bool, reason: str = None, message: discord.Message = None):
     channel = interaction.channel
     closer = interaction.user
-    message = interaction.message
+    # Prefer the message captured at button-click time; fall back to
+    # interaction.message for the non-modal ("Being handled") path.
+    message = message or interaction.message
     is_modal = interaction.type == discord.InteractionType.modal_submit
 
     if is_modal:
@@ -212,8 +246,8 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
     try:
         new_name = f"{emoji}-{channel.name.lstrip('🟡🔵🟢🔴-')}"
         await channel.edit(name=new_name[:100])
-    except:
-        pass
+    except Exception as e:
+        print(f"Status update channel rename error: {e}")
 
     embed = message.embeds[0]
     embed.title = f"{emoji} {status}"
@@ -238,8 +272,8 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
         if creator_member and (r := interaction.guild.get_role(REPORTER_ROLE_ID)):
             try:
                 await creator_member.remove_roles(r)
-            except:
-                pass
+            except Exception as e:
+                print(f"Remove reporter role error: {e}")
 
         # DM Creator
         if creator_member:
@@ -253,8 +287,8 @@ async def handle_status_update(interaction: discord.Interaction, emoji: str, sta
                 if reason:
                     dm_embed.add_field(name="Reason", value=reason)
                 await creator_member.send(embed=dm_embed)
-            except:
-                pass
+            except Exception as e:
+                print(f"DM creator error: {e}")
 
         # Close channel + change view
         await asyncio.sleep(2)
